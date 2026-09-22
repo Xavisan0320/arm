@@ -1,0 +1,26 @@
+# uroarm6 - Python 3.11 (known good: 3.11.9), Windows.
+# Install with setup_venv.ps1 rather than plain `pip install -r`: the order and
+# the OpenCV swap at the end matter (see SETUP.md).
+
+# Pinned to 1.x: opencv-contrib-python 4.5.5 is built against numpy 1.x.
+numpy==1.26.4
+
+# 4.5.5 on purpose - marker.py uses the old ArUco API
+# (aruco.estimatePoseSingleMarkers), removed in OpenCV 4.7+.
+# ultralytics pulls in opencv-python as well; setup_venv.ps1 removes it again
+# and reinstalls this one, because the two share the cv2 package.
+opencv-contrib-python==4.5.5.64
+
+# LGPL v3 release (2026) on PyPI - no license key needed.
+pysimplegui==6.2
+
+scikit-learn==1.9.0
+scipy==1.17.1
+pyserial==3.5
+pynput==1.8.2          # yoko.py (keyboard jog tool)
+requests==2.34.2       # util.py
+tqdm==4.69.0           # util.py
+
+# YOLO detection (infer.py). torch/torchvision are installed first, CPU build,
+# from the PyTorch index - see setup_venv.ps1.
+ultralytics==8.4.102
