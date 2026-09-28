@@ -185,6 +185,11 @@ MANUAL_POS_SPEED, MANUAL_ANGLE_SPEED = 60.0, 60.0                        # mm/s 
 # move at all). Harmless overlap when holding does work - at most one extra
 # small step layered on top of the continuous jog.
 MANUAL_FALLBACK_STEP = 5.0
+
+# 掴み直し (retry): how far one correction press moves the grab target, in mm
+# (x the 1-5 amount picked on the keypad). The keypad is in the ARM's frame as
+# seen from the base - see retry_step_dirs.
+RETRY_STEP = 10.0
 # Z's floor is 20, not 0: below that the arm frequently can't hold the pose
 # at all (with R1/R2/R3 free to roam, unlike the main jog's fixed-vertical
 # tool, there's no single X/Y-independent cutoff the way Z_MIN/Z_MAX are for
@@ -952,6 +957,9 @@ def set_plane(vecs):
 
     return normal_vector, basis_point
 
+last_grab = None          # the last grab attempt, so 掴み直し can repeat it
+
+
 def get_arm_xyz_of_work(color, shape):
     """Return (scr_x, scr_y, arm_x, arm_y, arm_z) of the currently detected work
     matching color/shape (either may be None to mean "any"), or five NaNs when
@@ -1076,16 +1084,26 @@ def aim_text(arm_x, arm_y, arm_z):
     return (f'狙い: {where} → 垂直で掴む', f'r{radius:.0f} OK', (0, 200, 0))
 
 
-def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE):
+def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=True):
     """Pick the work at (arm_x, arm_y, arm_z) and drop it into box_xyz.
-    close_deg is the hand angle to close to (per-item, set in grip settings)."""
-    global is_moving
+    close_deg is the hand angle to close to (per-item, set in grip settings).
+    remember=False leaves last_grab alone - 掴み直し uses that so its
+    correction applies to that one attempt only (see retry_grab)."""
+    global is_moving, last_grab
 
     # Decide the approach before moving at all (see grab_plan). The same pitch
     # is held over the item for the approach, the descent and the lift, so
     # the gripper doesn't swing while it's low; the traverse to the box
     # straightens it again on the way.
     z, r2, radius = grab_plan(arm_x, arm_y, arm_z)
+
+    # Remember the attempt so 掴み直し can repeat it with a correction. Kept
+    # even if this one is refused as out of reach - a correction may bring it
+    # back into range.
+    if remember:
+        last_grab = {'x': arm_x, 'y': arm_y, 'z': arm_z, 'box': list(box_xyz),
+                     'close': close_deg}
+
     if r2 is None:
         # Out of reach even at the full lean. This used to fall back to a
         # vertical grab, which get_pose_from_xyz then pulled in to the reach
@@ -1312,6 +1330,128 @@ def do_pick(color, shape):
     close_deg = grip_close.get(inference.class_name, DEFAULT_GRIP_CLOSE)
     set_state(f'{COLOR_LABEL[color]}/{SHAPE_LABEL[shape]} をつかみます (閉じ{close_deg:.0f})')
     return grab(ax, ay, az, boxes[color], close_deg)
+
+
+def retry_step_dirs(mm=RETRY_STEP):
+    """Arm-frame (dx, dy) for one press of each 掴み直し key, `mm` per press.
+
+    The keypad is in the ARM's own frame, as seen from the base looking out
+    over the table: 上 = 奥 (+X, away from the base), 下 = 手前 (-X),
+    右 = +Y, 左 = -Y. It deliberately does NOT follow the camera image: this
+    camera sits out beyond the work area looking back at the arm, so on screen
+    奥 is at the BOTTOM (the hand-eye fit has +X growing down the image) and a
+    screen-relative pad reads upside down - which is exactly how it felt. The
+    corners move X and Y by the full amount each."""
+    out = {'up': (mm, 0.0), 'down': (-mm, 0.0), 'left': (0.0, -mm), 'right': (0.0, mm)}
+    for ud in ('up', 'down'):
+        for lr in ('left', 'right'):
+            out[f'{ud}-{lr}'] = (out[ud][0] + out[lr][0], out[ud][1] + out[lr][1])
+    return out
+
+
+def open_retry_adjust(dirs):
+    """Modal keypad: which way was the grab off, and by how much. Returns the
+    (dx, dy) arm correction in mm, (0, 0) to try the same spot again, or None
+    to give up.
+
+    Arrows only - no text on the keys; the amount is picked on the right
+    (1-5, in cm; 1 = RETRY_STEP, the default), and the corners move X and Y by
+    that same amount each. 上 is 奥 and 下 is 手前, seen from the base - `dirs`
+    decides that, see retry_step_dirs."""
+    KEY = dict(size=(5, 2), font=('Helvetica', 22, 'bold'))
+    tip = ('ベースから見た向き（上＝奥、下＝手前）に、'
+           '右で選んだぶんだけずらして掴み直します')
+
+    def key(name, arrow):
+        return sg.Button(arrow, key=f'-{name}-', tooltip=tip, **KEY)
+
+    pad = [
+        [ key('up-left', '↖'),   key('up', '▲'),   key('up-right', '↗') ],
+        [ key('left', '◀'),
+          sg.Button('↻', key='-same-', tooltip='同じ位置でもう一度', **KEY),
+          key('right', '▶') ],
+        [ key('down-left', '↙'), key('down', '▼'), key('down-right', '↘') ],
+    ]
+    side = [
+        [ sg.Text('補正量') ],
+        [ sg.Combo(list(range(1, 6)), default_value=1, key='-amount-', readonly=True,
+                    size=(4, 1), font=('Helvetica', 16)) ],
+        [ sg.Text('cm') ],
+    ]
+
+    layout = [
+        [ sg.Column(pad, element_justification='center'),
+          sg.VerticalSeparator(),
+          sg.Column(side, element_justification='center', pad=((12, 4), (24, 0))) ],
+        [ sg.HorizontalSeparator() ],
+        [ sg.Button('中止', key='-cancel-') ],
+    ]
+    win = sg.Window('掴み直し', layout, modal=True, finalize=True)
+
+    result = None
+    while True:
+        ev, vals = win.read()
+        if ev in (sg.WIN_CLOSED, '-cancel-'):
+            break
+        if ev == '-same-':
+            result = (0.0, 0.0)
+            break
+        if isinstance(ev, str) and ev[1:-1] in dirs:
+            try:
+                amount = float(vals['-amount-'])
+            except (KeyError, TypeError, ValueError):
+                amount = 1.0
+            dx, dy = dirs[ev[1:-1]]
+            result = (dx * amount, dy * amount)
+            break
+
+    win.close()
+    return result
+
+
+def retry_lift():
+    """掴み直し step 1: rise straight up from wherever it stopped, so the
+    item is clear of the gripper before going in again."""
+    set_phase('掴み直し: 一度持ち上げて停止します')
+    cx, cy = forward_kinematics(servo_angles)[:2]
+    for _ in parallel(open_hand(), move_xyz(cx, cy, carry_z(cx, cy))):
+        yield
+
+
+def retry_ask():
+    """掴み直し: ask which way the grab was off, right when the button is
+    pressed (the arm has already been stopped). Returns the (dx, dy)
+    correction in mm, or None if there is nothing to retry / the user gave
+    up."""
+    if last_grab is None:
+        set_state('掴み直し: 直前の掴み動作がありません')
+        return None
+
+    picked = open_retry_adjust(retry_step_dirs())
+    if picked is None:
+        set_state('掴み直しを中止しました')
+    return picked
+
+
+def retry_grab(dx, dy):
+    """掴み直し step 2: lift clear, then grab again `dx, dy` mm away from
+    the last attempt - and carry on into the box exactly like a normal pick,
+    so auto-sort just continues after it.
+
+    The correction is for this one attempt only: remember=False keeps
+    last_grab on the position that was actually detected, so a second
+    掴み直し starts from there again instead of stacking corrections, and
+    nothing carries over into the next item or any later move."""
+    g = last_grab
+    nx, ny = g['x'] + dx, g['y'] + dy
+    print(f'retry: ({g["x"]:.0f},{g["y"]:.0f}) -> ({nx:.0f},{ny:.0f}) '
+          f'correction ({dx:+.0f},{dy:+.0f})')
+    set_state(f'掴み直し: X{nx:.0f} Y{ny:.0f} ({dx:+.0f},{dy:+.0f}) でもう一度')
+
+    for _ in retry_lift():
+        yield
+    for _ in grab(nx, ny, g['z'], g['box'], g['close'], remember=False):
+        yield
 
 
 def open_sequence_editor(params):
@@ -1844,6 +1984,9 @@ if __name__ == '__main__':
             sg.Button('つかんで置く', key='pick', size=(18, 2)),
             sg.Button('自動仕分け 開始', key='auto', size=(18, 2)),
         ],
+        [ sg.Button('掴み直し', key='retry', size=(18, 2)),
+          sg.Button('やり直し', key='reset-all', size=(18, 2),
+                    tooltip='動作を中断してすべての状態をリセットし、Ready に戻る') ],
         [ sg.Button('つかむ強さの設定', key='grip-settings'),
           sg.Button('自動仕分けの設定', key='auto-setup'),
           sg.Button('手動', key='manual-control') ],
@@ -2003,6 +2146,39 @@ if __name__ == '__main__':
                 g = do_pick(sel_color, sel_shape)
                 if g is not None:
                     moving = g
+
+        elif event == 'retry':
+            # Stop whatever is running and show the keypad straight away; the
+            # lift happens as the first part of the corrected grab. In
+            # auto-sort this interrupts the step in flight; auto_state goes
+            # back to idle so the sequence picks up again once the corrected
+            # grab is done.
+            moving = None
+            is_moving = False
+            auto_state = 'idle'
+            picked = retry_ask()
+            if picked is not None:
+                moving = retry_grab(*picked)
+
+        elif event == 'reset-all':
+            # やり直し: the "get me out of here" button. Available mid-move -
+            # it must not queue behind whatever is running - it throws away
+            # every bit of in-flight state (the running motion, auto-sort's
+            # place in the queue, a held jog key, the 掴み直し target) and
+            # walks back to Ready. The YOLO process and the chosen target/box
+            # settings are left alone: they are settings, not state.
+            moving = None
+            is_moving = False
+            auto_mode = False
+            auto_step_idx = 0
+            auto_state = 'idle'
+            window['auto'].update('自動仕分け 開始')
+            jog_dir = None
+            jog_pos = None
+            hand_dir = 0
+            last_grab = None
+            moving = move_to_ready()
+            set_state('やり直し: 状態をリセットして Ready に戻ります')
 
         elif event == 'auto':
             # Run / stop only - the order is set up separately (auto-setup)
