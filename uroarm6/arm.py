@@ -8,7 +8,7 @@ from sklearn.linear_model import LinearRegression
 from camera import initCamera, closeCamera, getCameraFrame
 from util import nax, jKeys, pose_keys, read_params, radian, write_params, get_move_time, set_move_time, spin, degree, Vec2, Vec3, sleep, get_pose, show_pose, GRIP_CLOSE_MIN, GRIP_OPEN
 from servo import init_servo, set_servo_angle, angle_to_servo, servo_to_angle, servo_angles
-from kinematics import forward_kinematics, inverse_kinematics, nudge_into_reach, joint_travel, facing_r1, normalize_radian
+from kinematics import forward_kinematics, inverse_kinematics, nudge_into_reach, joint_travel, facing_r1, normalize_radian, holds_pose
 from marker import init_markers, detect_markers
 
 hand_idx = nax - 1
@@ -185,6 +185,15 @@ MANUAL_POS_SPEED, MANUAL_ANGLE_SPEED = 60.0, 60.0                        # mm/s 
 # move at all). Harmless overlap when holding does work - at most one extra
 # small step layered on top of the continuous jog.
 MANUAL_FALLBACK_STEP = 5.0
+
+# 縦掴み (vertical grab): how far to turn the gripper on its own axis
+# (tool roll, R1/J6) before descending onto the item, in degrees. 90 puts the
+# jaws across the other horizontal direction - the gripper seen from the front
+# turns edge-on - for an item that lies the wrong way round for the normal
+# grip. The mode is a button, off at startup, and is not saved to
+# data/arm.json: it is a per-run choice, not a calibrated value.
+VERTICAL_GRAB_ROLL = 90.0
+vertical_grab = False
 
 # 掴み直し (retry): how far one correction press moves the grab target, in mm
 # (x the 1-5 amount picked on the keypad). The keypad is in the ARM's frame as
@@ -370,7 +379,7 @@ def move_linear(dst, move_time=None):
 _last_reach_msg = None
 
 
-def get_pose_from_xyz(x, y, z, r1=None, r2=None):
+def get_pose_from_xyz(x, y, z, r1=None, r2=None, roll=0.0):
     """Build a pose from a target TCP position.
 
     x is clamped into the reachable range instead of raising, so a bad target
@@ -388,6 +397,10 @@ def get_pose_from_xyz(x, y, z, r1=None, r2=None):
     any Y, not just at calibrate_xy's own sample points. Pass an explicit r1
     to override this for a specific call, e.g. r1 = 0.0 if some future
     caller genuinely wants the old "roll follows the base" behaviour.
+
+    roll turns the gripper that many degrees about its own axis on top of
+    the facing roll - 縦掴み passes VERTICAL_GRAB_ROLL (ignored when r1 is
+    given explicitly, which already says exactly what the roll must be).
 
     r2 is the tool pitch in degrees; None means PICK_PITCH (straight down).
     grab() passes it explicitly (see grab_pitch), and an explicit r2 also
@@ -437,6 +450,25 @@ def get_pose_from_xyz(x, y, z, r1=None, r2=None):
     if r1 is None:
         r1 = facing_r1(xc, yc, z, radian(pitch))
 
+        if roll:
+            # +roll and -roll leave the jaws on the same line, so when J6
+            # cannot make one of them (facing_r1 has often spent much of its
+            # travel already) the other is an exact substitute, not a
+            # compromise. If neither holds, grip the normal way round rather
+            # than silently asking for an angle the servo would clamp.
+            travel = joint_travel()
+            for extra in (radian(roll), -radian(roll)):
+                if holds_pose([xc, yc, z, r1 + extra, radian(pitch), 0.0], travel):
+                    r1 += extra
+                    break
+            else:
+                print(f'get_pose_from_xyz: roll {roll:+.0f} deg does not fit J6 travel '
+                      f'at ({xc:.0f},{yc:.0f},{z:.0f}) - gripping the normal way round')
+                try:
+                    set_state(f'縦掴み: 手首の可動範囲外なので通常の向きで掴みます')
+                except NameError:
+                    pass
+
     # R3 = 0 keeps the tool in the vertical plane the arm swings in, exactly
     # what the arm did before the J4 roll joint was added. A pitch below 90
     # therefore always leans the gripper radially outward, away from the base.
@@ -444,12 +476,12 @@ def get_pose_from_xyz(x, y, z, r1=None, r2=None):
 
     return pose
 
-def move_xyz_now(x, y, z, r1=None, r2=None):
+def move_xyz_now(x, y, z, r1=None, r2=None, roll=0.0):
     """Command the pose for (x, y, z) outright (no interpolation). Returns
     whether it actually held - i.e. whether the pose was reachable at all -
     so a caller like the jog loop can tell an ignored command from a real
     move rather than just going quiet."""
-    pose = get_pose_from_xyz(x, y, z, r1, r2)
+    pose = get_pose_from_xyz(x, y, z, r1, r2, roll)
     rads = inverse_kinematics(pose)
 
     if rads is None:
@@ -461,8 +493,8 @@ def move_xyz_now(x, y, z, r1=None, r2=None):
     return True
 
 
-def move_xyz(x, y, z, move_time=None, r1=None, r2=None):
-    pose = get_pose_from_xyz(x, y, z, r1, r2)
+def move_xyz(x, y, z, move_time=None, r1=None, r2=None, roll=0.0):
+    pose = get_pose_from_xyz(x, y, z, r1, r2, roll)
     for _ in move_linear(pose, move_time):
         yield
 
@@ -1077,11 +1109,14 @@ def aim_text(arm_x, arm_y, arm_z):
     if r2 is None:
         return (f'狙い: {where} → 届かない (傾けても{MAX_REACH_TILT_DEG}°が上限)',
                 f'NG r{radius:.0f}', (0, 0, 255))
+    vg = f' (縦掴み)' if vertical_grab else ''
+    tag = ' V' if vertical_grab else ''
     lean = PICK_PITCH - r2
     if lean:
-        return (f'狙い: {where} → {lean:.0f}°傾けて掴む',
-                f'r{radius:.0f} tilt{lean:.0f}', (0, 165, 255))
-    return (f'狙い: {where} → 垂直で掴む', f'r{radius:.0f} OK', (0, 200, 0))
+        return (f'狙い: {where} → {lean:.0f}°傾けて掴む{vg}',
+                f'r{radius:.0f} tilt{lean:.0f}{tag}', (0, 165, 255))
+    return (f'狙い: {where} → 垂直で掴む{vg}', f'r{radius:.0f} OK{tag}',
+            (0, 200, 0))
 
 
 def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=True):
@@ -1124,10 +1159,16 @@ def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=Tr
     # degrees (all that's needed just past the vertical limit) is not
     # visible by eye, so "did it tilt?" has to be readable somewhere.
     lean = PICK_PITCH - r2
+    # 縦掴み: held from the traverse over the item through the descent, the
+    # close and the lift - the same phases that hold the pitch, so the gripper
+    # never turns while it is down among the other items. The carry to the box
+    # takes the default roll again.
+    roll = VERTICAL_GRAB_ROLL if vertical_grab else 0.0
     print(f'grab: target ({arm_x:.0f},{arm_y:.0f}) radius {radius:.0f}mm - '
           + (f'leaning {lean:.0f} deg outward (past vertical reach)' if lean
-             else 'straight down (within vertical reach)'))
-    how = f'{lean:.0f}°傾けて' if lean else '垂直で'
+             else 'straight down (within vertical reach)')
+          + (f', gripper rolled {roll:.0f} deg (縦掴み)' if roll else ''))
+    how = (f'{lean:.0f}°傾けて' if lean else '垂直で') + ('' if not roll else f'縦掴みで')
 
     # Rise straight up first (gripper opening on the way), then move over to
     # the item, then descend - never translate horizontally while low, or
@@ -1138,13 +1179,14 @@ def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=Tr
         yield
 
     set_phase(f'対象の上へ移動中 (半径{radius:.0f}mm, {how}掴む)')
-    for _ in move_xyz(arm_x, arm_y, carry_z(arm_x, arm_y, r2), r2=r2):
+    # The roll is finished here, above the item, before any Z comes down.
+    for _ in move_xyz(arm_x, arm_y, carry_z(arm_x, arm_y, r2), r2=r2, roll=roll):
         yield
 
     set_phase(f'下降中 ({how}掴む)')
     # Lower straight down onto the item, slowly - the gripper is about to close
     # on it and a fast drop knocks it over.
-    for _ in move_xyz(arm_x, arm_y, z, DESCEND_TIME, r2=r2):
+    for _ in move_xyz(arm_x, arm_y, z, DESCEND_TIME, r2=r2, roll=roll):
         yield
 
     for _ in sleep(0.5):
@@ -1159,7 +1201,7 @@ def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=Tr
 
     # Raise the hand clear of the clutter.
     set_phase('持ち上げ中')
-    for _ in move_xyz(arm_x, arm_y, carry_z(arm_x, arm_y, r2), r2=r2):
+    for _ in move_xyz(arm_x, arm_y, carry_z(arm_x, arm_y, r2), r2=r2, roll=roll):
         yield
 
     # Carry to the box and let go BOX_DROP_HEIGHT above it - it drops in,
@@ -1987,6 +2029,9 @@ if __name__ == '__main__':
         [ sg.Button('掴み直し', key='retry', size=(18, 2)),
           sg.Button('やり直し', key='reset-all', size=(18, 2),
                     tooltip='動作を中断してすべての状態をリセットし、Ready に戻る') ],
+        [ sg.Button(f'縦掴み: OFF', key='vgrab', size=(18, 2),
+                    tooltip=f'ON の間は、Z を下げる前にグリッパーを'
+                            f'{VERTICAL_GRAB_ROLL:.0f}°回して（縦にして）掴みに行く') ],
         [ sg.Button('つかむ強さの設定', key='grip-settings'),
           sg.Button('自動仕分けの設定', key='auto-setup'),
           sg.Button('手動', key='manual-control') ],
@@ -2159,6 +2204,15 @@ if __name__ == '__main__':
             picked = retry_ask()
             if picked is not None:
                 moving = retry_grab(*picked)
+
+        elif event == 'vgrab':
+            # A mode, not a motion: it only changes how the NEXT grab
+            # approaches (see grab()), so it is safe to toggle at any time and
+            # deliberately survives やり直し - like the target/box settings.
+            vertical_grab = not vertical_grab
+            window['vgrab'].update(f'縦掴み: ' + ('ON' if vertical_grab else 'OFF'))
+            set_state(f'縦掴み: ' + (f'ON - グリッパーを{VERTICAL_GRAB_ROLL:.0f}°回して掴みます'
+                                   if vertical_grab else 'OFF - 通常の向きで掴みます'))
 
         elif event == 'reset-all':
             # やり直し: the "get me out of here" button. Available mid-move -
