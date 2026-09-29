@@ -276,13 +276,13 @@
         "z": 0.0
     },
     "grip-close": {
-        "red_cube": 18.0,
+        "red_cube": 8.0,
         "red_ragby": 7.0,
         "red_pyramid": 5.0,
-        "green_cube": 18.0,
+        "green_cube": 6.0,
         "green_ragby": 5.0,
         "green_pyramid": 5.0,
-        "blue_cube": 14.0,
+        "blue_cube": 3.0,
         "blue_ragby": 5.0,
         "blue_pyramid": 5.0
     },
@@ -299,5 +299,6 @@
             "green",
             "cube"
         ]
-    ]
+    ],
+    "auto-vertical-gap": 50.0
 }

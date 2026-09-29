@@ -20,7 +20,7 @@ def infer_img(img_que: Queue, result_que: Queue):
         bmp, color, shape = img_que.get()
 
         if bmp is None:
-            result_que.put((np.nan, np.nan, None))
+            result_que.put((np.nan, np.nan, None, []))
             break
 
         # print(
@@ -42,6 +42,12 @@ def infer_img(img_que: Queue, result_que: Queue):
         center_x = np.nan
         center_y = np.nan
         class_name = None
+
+        # Every detection in the frame, whatever its class - the caller needs
+        # the other items' positions too, not just the one it asked for (see
+        # arm.py's 自動縦掴み: how close the neighbours are decides how the
+        # gripper goes in).
+        items = []
 
         best_conf = 0.0
 
@@ -67,6 +73,17 @@ def infer_img(img_que: Queue, result_que: Queue):
                 #     flush=True
                 # )
 
+                x1, y1, x2, y2 = \
+                    box.xyxy[0].cpu().numpy()
+
+                items.append(
+                    (
+                        float((x1 + x2) / 2),
+                        float((y1 + y2) / 2),
+                        name
+                    )
+                )
+
                 # 色・形状が指定されている場合。クラス名は "{色}_{形状}" 形式
                 # ("red_cube", "red_ragby", ...) を前提に、どちらか片方だけの
                 # 指定でも絞り込めるようにする。
@@ -79,9 +96,6 @@ def infer_img(img_que: Queue, result_que: Queue):
 
                     if shape is not None and name_shape != shape:
                         continue
-
-                x1, y1, x2, y2 = \
-                    box.xyxy[0].cpu().numpy()
 
                 # confidenceが一番高いものを選ぶ
                 if confidence > best_conf:
@@ -119,7 +133,8 @@ def infer_img(img_que: Queue, result_que: Queue):
             (
                 center_x,
                 center_y,
-                class_name
+                class_name,
+                items
             )
         )
 
@@ -133,6 +148,7 @@ class Inference:
         self.cx = np.nan
         self.cy = np.nan
         self.class_name = None
+        self.items = []          # every detection of the last frame - see all_items()
 
         self.pw = Process(
             target=infer_img,
@@ -181,8 +197,14 @@ class Inference:
 
         try:
 
-            cx, cy, class_name = \
+            cx, cy, class_name, items = \
                 self.result_que.get_nowait()
+
+            # 720x720 → 元画像サイズ (the target below is scaled the same way)
+            self.items = [
+                (ix * w / 720, iy * h / 720, name)
+                for ix, iy, name in items
+            ]
 
             # print(
             #     f"GET RESULT: "
@@ -219,6 +241,14 @@ class Inference:
             self.class_name
         )
 
+    def all_items(self):
+        """[(screen x, screen y, class name), ...] for every item detected in
+        the last frame, unfiltered by色/形 - get() returns only the one that
+        matches, but a caller that has to know how crowded the table is needs
+        all of them (arm.py's 自動縦掴み)."""
+
+        return list(self.items)
+
     def close(self):
 
         self.img_que.put(
@@ -227,7 +257,7 @@ class Inference:
 
         while True:
 
-            cx, cy, class_name = \
+            cx, cy, class_name, _ = \
                 self.result_que.get()
 
             if np.isnan(cx):

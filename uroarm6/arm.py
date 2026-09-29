@@ -195,6 +195,22 @@ MANUAL_FALLBACK_STEP = 5.0
 VERTICAL_GRAB_ROLL = 90.0
 vertical_grab = False
 
+# 自動縦掴み (auto vertical grab): with this mode on, every item on the table is
+# located and the gripper is turned (as above) only when the one being picked
+# has a neighbour within auto_vertical_gap mm - i.e. only where the jaws would
+# otherwise risk the item next door. Centre-to-centre in arm coordinates, so
+# it does not depend on where in the image the pair sits. The distance is
+# tuned live from its own dialog (open_autov_settings) and kept in
+# data/arm.json under 'auto-vertical-gap'; this is only the starting value.
+AUTO_VERTICAL_GAP = 50.0
+AUTO_VERTICAL_GAP_MIN, AUTO_VERTICAL_GAP_MAX = 10.0, 150.0
+auto_vertical_gap = AUTO_VERTICAL_GAP
+# Two detections closer than this are taken to be the same physical item
+# (the model can put two overlapping boxes on one object); no two real items'
+# centres can be this close, and the 3cm case this mode is for is well clear.
+SAME_ITEM_MM = 10.0
+auto_vertical_grab = False
+
 # 掴み直し (retry): how far one correction press moves the grab target, in mm
 # (x the 1-5 amount picked on the keypad). The keypad is in the ARM's frame as
 # seen from the base - see retry_step_dirs.
@@ -990,6 +1006,48 @@ def set_plane(vecs):
     return normal_vector, basis_point
 
 last_grab = None          # the last grab attempt, so 掴み直し can repeat it
+last_gap = None           # mm to the nearest other item at the last detection
+
+
+def nearest_item_gap(scr_x, scr_y):
+    """How far the item at the screen point (scr_x, scr_y) is from the nearest
+    OTHER item on the table, in mm, or None if that cannot be told (no model
+    running, or nothing else detected).
+
+    Measured in arm coordinates, not pixels: the camera looks along the table
+    so the same pixel gap means different millimetres near and far. Class is
+    ignored - a red cube is just as much in the way as another target."""
+    if inference is None:
+        return None
+
+    items = inference.all_items()
+    if not items:
+        return None
+
+    try:
+        x0, y0, _ = get_arm_xyz_from_screen(scr_x, scr_y)
+        gap = None
+        for ix, iy, _name in items:
+            x1, y1, _ = get_arm_xyz_from_screen(ix, iy)
+            d = math.hypot(x1 - x0, y1 - y0)
+            if d <= SAME_ITEM_MM:
+                continue          # itself, or a second box on the same item
+            gap = d if gap is None else min(gap, d)
+        return gap
+    except Exception as e:
+        print('nearest_item_gap:', e)
+        return None
+
+
+def wants_vertical(gap):
+    """Should this pick turn the gripper? The button forces it; 自動縦掴み
+    turns it on only where the item has a close neighbour (see
+    auto_vertical_gap). Returns (roll in degrees, why - for the log/readout)."""
+    if vertical_grab:
+        return VERTICAL_GRAB_ROLL, '縦掴み'
+    if auto_vertical_grab and gap is not None and gap <= auto_vertical_gap:
+        return VERTICAL_GRAB_ROLL, f'自動縦掴み: 隣まで{gap:.0f}mm'
+    return 0.0, ''
 
 
 def get_arm_xyz_of_work(color, shape):
@@ -1013,6 +1071,13 @@ def get_arm_xyz_of_work(color, shape):
     arm_z += pick_offset['z']
 
     print(f'{class_name} {arm_x:.1f} {arm_y:.1f} {arm_z:.1f}')
+
+    # How crowded it is right there decides how the gripper goes in (see
+    # wants_vertical); read off the same frame as the pick itself. Only when
+    # the mode is on - with it off nothing here runs at all, so a pick is
+    # exactly the pick it was before the mode existed.
+    global last_gap
+    last_gap = nearest_item_gap(work_scr_x, work_scr_y) if auto_vertical_grab else None
 
     return work_scr_x, work_scr_y, arm_x, arm_y, arm_z
 
@@ -1101,16 +1166,21 @@ def grab_plan(arm_x, arm_y, arm_z):
     return z, grab_pitch(arm_x, arm_y, (z, LIFT_Z)), math.hypot(arm_x, arm_y)
 
 
-def aim_text(arm_x, arm_y, arm_z):
+def aim_text(arm_x, arm_y, arm_z, gap=None):
     """(status line, short on-image label, BGR colour) describing grab_plan
-    for an item at (arm_x, arm_y, arm_z) - for the live aim readout."""
+    for an item at (arm_x, arm_y, arm_z) - for the live aim readout. gap is
+    the distance to the nearest other item, which decides the gripper
+    orientation under 自動縦掴み (see wants_vertical)."""
     z, r2, radius = grab_plan(arm_x, arm_y, arm_z)
     where = f'X{arm_x:.0f} Y{arm_y:.0f} 半径{radius:.0f}mm'
+    if auto_vertical_grab and gap is not None:
+        where += f' 隣{gap:.0f}mm'
     if r2 is None:
         return (f'狙い: {where} → 届かない (傾けても{MAX_REACH_TILT_DEG}°が上限)',
                 f'NG r{radius:.0f}', (0, 0, 255))
-    vg = f' (縦掴み)' if vertical_grab else ''
-    tag = ' V' if vertical_grab else ''
+    roll, why = wants_vertical(gap)
+    vg = f' ({why})' if roll else ''
+    tag = ' V' if roll else ''
     lean = PICK_PITCH - r2
     if lean:
         return (f'狙い: {where} → {lean:.0f}°傾けて掴む{vg}',
@@ -1119,11 +1189,15 @@ def aim_text(arm_x, arm_y, arm_z):
             (0, 200, 0))
 
 
-def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=True):
+def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=True,
+         gap=None):
     """Pick the work at (arm_x, arm_y, arm_z) and drop it into box_xyz.
     close_deg is the hand angle to close to (per-item, set in grip settings).
     remember=False leaves last_grab alone - 掴み直し uses that so its
-    correction applies to that one attempt only (see retry_grab)."""
+    correction applies to that one attempt only (see retry_grab).
+    gap is the distance to the nearest other item (mm); None means the one
+    measured at the last detection, which is what both pick paths want since
+    they detect and then grab straight away."""
     global is_moving, last_grab
 
     # Decide the approach before moving at all (see grab_plan). The same pitch
@@ -1135,9 +1209,11 @@ def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=Tr
     # Remember the attempt so 掴み直し can repeat it with a correction. Kept
     # even if this one is refused as out of reach - a correction may bring it
     # back into range.
+    if gap is None:
+        gap = last_gap
     if remember:
         last_grab = {'x': arm_x, 'y': arm_y, 'z': arm_z, 'box': list(box_xyz),
-                     'close': close_deg}
+                     'close': close_deg, 'gap': gap}
 
     if r2 is None:
         # Out of reach even at the full lean. This used to fall back to a
@@ -1163,11 +1239,12 @@ def grab(arm_x, arm_y, arm_z, box_xyz, close_deg=DEFAULT_GRIP_CLOSE, remember=Tr
     # close and the lift - the same phases that hold the pitch, so the gripper
     # never turns while it is down among the other items. The carry to the box
     # takes the default roll again.
-    roll = VERTICAL_GRAB_ROLL if vertical_grab else 0.0
+    roll, why = wants_vertical(gap)
     print(f'grab: target ({arm_x:.0f},{arm_y:.0f}) radius {radius:.0f}mm - '
           + (f'leaning {lean:.0f} deg outward (past vertical reach)' if lean
              else 'straight down (within vertical reach)')
-          + (f', gripper rolled {roll:.0f} deg (縦掴み)' if roll else ''))
+          + (f', gripper rolled {roll:.0f} deg ({why})' if roll else '')
+          + ('' if gap is None else f' [nearest item {gap:.0f}mm]'))
     how = (f'{lean:.0f}°傾けて' if lean else '垂直で') + ('' if not roll else f'縦掴みで')
 
     # Rise straight up first (gripper opening on the way), then move over to
@@ -1492,7 +1569,10 @@ def retry_grab(dx, dy):
 
     for _ in retry_lift():
         yield
-    for _ in grab(nx, ny, g['z'], g['box'], g['close'], remember=False):
+    # the same item, so the same neighbours: repeat the orientation the
+    # first attempt used rather than re-deciding from a stale measurement
+    for _ in grab(nx, ny, g['z'], g['box'], g['close'], remember=False,
+                  gap=g.get('gap')):
         yield
 
 
@@ -1865,6 +1945,50 @@ def open_manual_control():
     win.close()
 
 
+def open_autov_settings(params):
+    """Modal dialog for the 自動縦掴み distance: how close another item has to
+    be before the gripper is turned. Centre to centre, in millimetres, in arm
+    coordinates. Saves to data/arm.json ('auto-vertical-gap') and returns the
+    new value, or None if cancelled."""
+    layout = [
+        [ sg.Text('自動縦掴み: どれだけ近ければ縦にして掴むか') ],
+        [ sg.Text('アイテムの中心どうしの距離です。これ以内に他のアイテムが\n'
+                  'あるときだけ、グリッパーを回して掴みに行きます。',
+                  font=('Helvetica', 9)) ],
+        [ sg.Slider(range=(AUTO_VERTICAL_GAP_MIN, AUTO_VERTICAL_GAP_MAX), resolution=5,
+                    orientation='h', default_value=float(auto_vertical_gap),
+                    size=(34, 20), enable_events=True, key='-av-gap-'),
+          sg.Text('mm') ],
+        [ sg.Text('', key='-av-note-', size=(40, 1), font=('Helvetica', 9)) ],
+        [ sg.HorizontalSeparator() ],
+        [ sg.Button('保存', key='-av-save-', size=(8, 1)),
+          sg.Button('キャンセル', key='-av-cancel-', size=(10, 1)) ],
+    ]
+    win = sg.Window('自動縦掴みの距離', layout, modal=True, finalize=True)
+
+    def note(v):
+        win['-av-note-'].update(f'{v:.0f}mm 以内に他のアイテムがあれば縦にして掴みます'
+                                f'（およそ {v / 10:.1f}cm）')
+
+    note(float(auto_vertical_gap))
+
+    value = None
+    while True:
+        ev, vals = win.read()
+        if ev in (sg.WIN_CLOSED, '-av-cancel-'):
+            break
+        if ev == '-av-gap-':
+            note(float(vals['-av-gap-']))
+        elif ev == '-av-save-':
+            value = float(vals['-av-gap-'])
+            params['auto-vertical-gap'] = value
+            write_params(params)
+            break
+
+    win.close()
+    return value
+
+
 def open_grip_settings(params, grip_close):
     """Modal dialog to tune the per-item close angle. Each item has a slider,
     and moving it closes the real gripper to that angle right away - so the
@@ -1970,6 +2094,10 @@ if __name__ == '__main__':
     grip_close = {f'{c}_{s}': DEFAULT_GRIP_CLOSE for c in SORT_COLORS for s in SHAPES}
     grip_close.update(params.get('grip-close', {}))
 
+    # the 自動縦掴み distance is a tuned value, so it is remembered (the mode
+    # itself is not - it starts off every run)
+    auto_vertical_gap = float(params.get('auto-vertical-gap', AUTO_VERTICAL_GAP))
+
     init_servo(params)
     init_markers(params)
     initCamera(params)
@@ -2029,9 +2157,14 @@ if __name__ == '__main__':
         [ sg.Button('掴み直し', key='retry', size=(18, 2)),
           sg.Button('やり直し', key='reset-all', size=(18, 2),
                     tooltip='動作を中断してすべての状態をリセットし、Ready に戻る') ],
-        [ sg.Button(f'縦掴み: OFF', key='vgrab', size=(18, 2),
+        [ sg.Button('縦掴み: OFF', key='vgrab', size=(18, 2),
                     tooltip=f'ON の間は、Z を下げる前にグリッパーを'
-                            f'{VERTICAL_GRAB_ROLL:.0f}°回して（縦にして）掴みに行く') ],
+                            f'{VERTICAL_GRAB_ROLL:.0f}°回して（縦にして）掴みに行く'),
+          sg.Button('自動縦掴み: OFF', key='vgrab-auto', size=(18, 2),
+                    tooltip='ON の間は、他のアイテムが近いときだけ縦にして掴む'
+                            '（縦掴み が ON なら常に縦）') ],
+        [ sg.Button(f'自動縦掴みの距離設定 ({auto_vertical_gap:.0f}mm)', key='autov-settings',
+                    size=(38, 1)) ],
         [ sg.Button('つかむ強さの設定', key='grip-settings'),
           sg.Button('自動仕分けの設定', key='auto-setup'),
           sg.Button('手動', key='manual-control') ],
@@ -2204,6 +2337,21 @@ if __name__ == '__main__':
             picked = retry_ask()
             if picked is not None:
                 moving = retry_grab(*picked)
+
+        elif event == 'autov-settings':
+            picked_gap = open_autov_settings(params)
+            if picked_gap is not None:
+                auto_vertical_gap = picked_gap
+                window['autov-settings'].update(f'自動縦掴みの距離設定 ({auto_vertical_gap:.0f}mm)')
+                set_state(f'自動縦掴みの距離: {auto_vertical_gap:.0f}mm 以内なら縦にして掴みます')
+
+        elif event == 'vgrab-auto':
+            # Same kind of mode as 'vgrab', but the decision is per item and
+            # is made at detection time (see nearest_item_gap/wants_vertical).
+            auto_vertical_grab = not auto_vertical_grab
+            window['vgrab-auto'].update('自動縦掴み: ' + ('ON' if auto_vertical_grab else 'OFF'))
+            set_state('自動縦掴み: ' + (f'ON - 他のアイテムが{auto_vertical_gap:.0f}mm 以内のときだけ縦にします'
+                                   if auto_vertical_grab else 'OFF'))
 
         elif event == 'vgrab':
             # A mode, not a motion: it only changes how the NEXT grab
@@ -2437,6 +2585,12 @@ if __name__ == '__main__':
                     if tcp_scr is not None:
                         cv2.circle(disp, (int(tcp_scr.x), int(tcp_scr.y)), 10, (0, 0, 255), -1)
 
+                if auto_vertical_grab and inference is not None:
+                    # the neighbours the mode is judging - small rings, so it
+                    # is visible on the view that every item was found
+                    for ix, iy, _n in inference.all_items():
+                        cv2.circle(disp, (int(ix), int(iy)), 6, (0, 255, 255), 2)
+
                 if not np.isnan(cx):
                     cv2.circle(disp, (int(cx), int(cy)), 18, (255, 0, 0), 3)
                     cv2.putText(disp, f'{class_name}', (int(cx) + 20, int(cy)),
@@ -2451,7 +2605,8 @@ if __name__ == '__main__':
                     ax += pick_offset['x']
                     ay += pick_offset['y']
                     az += pick_offset['z']
-                    text, label, colour = aim_text(ax, ay, az)
+                    gap = nearest_item_gap(cx, cy) if auto_vertical_grab else None
+                    text, label, colour = aim_text(ax, ay, az, gap)
                     window['-aim-'].update(text)
                     cv2.putText(disp, label, (int(cx) + 20, int(cy) + 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, colour, 2)
