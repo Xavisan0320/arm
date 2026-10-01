@@ -202,6 +202,12 @@ vertical_grab = False
 # it does not depend on where in the image the pair sits. The distance is
 # tuned live from its own dialog (open_autov_settings) and kept in
 # data/arm.json under 'auto-vertical-gap'; this is only the starting value.
+# (A 10mm Y correction for 縦掴み was tried here on 2026-09-30 and taken back
+# out the same day: on the real arm it made the miss worse, not better. It was
+# applied with the sign of the roll actually used, since +90 and -90 mirror the
+# jaw centre - if this is ever retried, that assumption is the thing to check
+# first, and it needs measuring separately for each roll direction.)
+
 AUTO_VERTICAL_GAP = 50.0
 AUTO_VERTICAL_GAP_MIN, AUTO_VERTICAL_GAP_MAX = 10.0, 150.0
 auto_vertical_gap = AUTO_VERTICAL_GAP
@@ -256,6 +262,49 @@ JOG_DIRS = {
 }
 
 # On-screen size of the camera panel (px).
+# ---------------------------------------------------------------- look and feel
+# Colours and fonts only: every row, element and size in the layout below is
+# left exactly as it was - apply_style() just themes what is already there.
+UI_FONT = 'メイリオ'       # Meiryo - has the Japanese glyphs (Tk falls back if absent)
+MONO_FONT = 'Consolas'          # numbers that should line up
+
+COL_BG = '#1b202b'              # window
+COL_PANEL = '#222938'           # inputs, tables
+COL_TEXT = '#e8ebf2'
+COL_MUTED = '#8b95a7'           # section headings, hints
+COL_LINE = '#2f3748'            # separators
+COL_BTN = ('#e8ebf2', '#333d52')             # ordinary button
+COL_ACCENT = ('#0d1117', '#58b7ff')          # the main actions
+COL_ON = ('#07130b', '#4ad17c')              # a mode that is switched on
+COL_WARN = ('#f5f7fa', '#b4603a')            # interrupt / quit
+COL_RED, COL_GREEN, COL_BLUE = '#e05561', '#3fb950', '#4c8bf5'
+
+THEME = {
+    'BACKGROUND': COL_BG,
+    'TEXT': COL_TEXT,
+    'INPUT': COL_PANEL,
+    'TEXT_INPUT': COL_TEXT,
+    'SCROLL': '#2b3344',
+    'BUTTON': COL_BTN,
+    'PROGRESS': ('#58b7ff', COL_PANEL),
+    'BORDER': 0,
+    'SLIDER_DEPTH': 0,
+    'PROGRESS_DEPTH': 0,
+}
+
+
+def apply_style():
+    """Theme every window this process opens (the main one and all the
+    dialogs). Call it before building any layout."""
+    sg.theme_add_new('Uroarm', dict(THEME))
+    sg.theme('Uroarm')
+    # Font and borders only - element padding and window margins keep their
+    # defaults ((5, 3) and (10, 5)), so nothing moves except by the few px
+    # the new type metrics bring with them.
+    sg.set_options(font=(UI_FONT, 10), border_width=0, slider_border_width=0,
+                   progress_meter_border_depth=0, tooltip_font=(UI_FONT, 9))
+
+
 CAM_VIEW = 560               # minimum camera view side (px); it grows with the window
 CONTROL_COL_WIDTH = 440      # the control column on the right, scrollbar included
 SCREEN_MARGIN_Y = 110        # screen height kept free for the title bar + taskbar
@@ -623,8 +672,18 @@ def apply_homography(H, pts):
     return q[:, :2] / q[:, 2:3]
 
 
+_calib_runs = 0
+
+
 def calibrate_xy():
-    global tcp_height
+    global tcp_height, _calib_runs
+
+    # Numbered so the console shows plainly how many runs were started: the
+    # completion box can only be reached once per run, so two boxes mean two
+    # runs (which is what the button guard below now prevents).
+    _calib_runs += 1
+    run_no = _calib_runs
+    print(f'calibrate_xy: run #{run_no} start')
 
     screen_coordinates = []
     robot_coordinates = []
@@ -771,7 +830,12 @@ def calibrate_xy():
               f'usable (need at least {MIN_CALIB_POINTS}) - NOT updating the hand-eye '
               f'calibration. The existing one is untouched. Check that the plane markers '
               f'(0-2) and the gripper markers (3+) are all steady and in view, then run '
-              f'Adjust XY again.')
+              f'キャリブレーション again.')
+        print(f'calibrate_xy: run #{run_no} abandoned')
+        # No popup on this path: the completion box below is the only one, and
+        # this run did NOT complete - it left the old calibration in place.
+        set_state(f'キャリブレーション中止: 使えたサンプルが{len(screen_coordinates)}件だけです'
+                  f'（{MIN_CALIB_POINTS}件以上必要）- 較正は変更していません')
         return
 
     if len(screen_coordinates) < total:
@@ -873,12 +937,14 @@ def calibrate_xy():
               f'{loo.mean():.1f}mm -> '
               + ('homography everywhere' if everywhere
                  else f'straight line near, homography past {HAND_EYE_BLEND[0]:.0f}mm'))
-        set_state(f'Adjust XY 完了: 遠方 平均{h_far.mean():.1f}mm / 手前 平均'
-                  f'{min(h_near.mean(), loo.mean()):.1f}mm')
+        summary = (f'遠方 平均{h_far.mean():.1f}mm / 手前 平均'
+                   f'{min(h_near.mean(), loo.mean()):.1f}mm')
+        set_state(f'キャリブレーション完了: {summary}')
     else:
         print(f'calibrate_xy: only {far_n} far samples came back (need 3) - far picks keep '
               f'using the straight-line fit. Are the far stations in the camera view?')
-        set_state(f'Adjust XY 完了 (遠方のサンプル不足: {far_n}件)')
+        summary = f'遠方のサンプル不足 ({far_n}件) - 遠方は直線近似のままです'
+        set_state(f'キャリブレーション完了 ({summary})')
 
     params['hand-eye'] = hand_eye
 
@@ -906,6 +972,12 @@ def calibrate_xy():
             prd_arm_x, prd_arm_y, prd_arm_z = prd[0, :]
 
             f.write(f'{scr_x}, {scr_y}, {height}, {arm_x}, {arm_y}, {arm_z}, {prd_arm_x}, {prd_arm_y}, {prd_arm_z}, {lean:.0f}\n')
+
+    # Say so plainly, once, and nothing else: it is a long run and the old
+    # ending was one line in the status area, easy to miss. The numbers stay in
+    # the status line and the log (see summary above).
+    print(f'calibrate_xy: run #{run_no} finished')
+    sg.popup('キャリブレーション完了', title='キャリブレーション', keep_on_top=True)
 
 
 def get_arm_xyz_from_screen(scr_x, scr_y):
@@ -1170,15 +1242,22 @@ def aim_text(arm_x, arm_y, arm_z, gap=None):
     """(status line, short on-image label, BGR colour) describing grab_plan
     for an item at (arm_x, arm_y, arm_z) - for the live aim readout. gap is
     the distance to the nearest other item, which decides the gripper
-    orientation under 自動縦掴み (see wants_vertical)."""
+    orientation under 自動縦掴み (see wants_vertical). It goes through the same
+    grab_plan()/wants_vertical() grab() uses, so the screen says what a pick
+    would really do."""
     z, r2, radius = grab_plan(arm_x, arm_y, arm_z)
+
+    if r2 is None:
+        return (f'狙い: X{arm_x:.0f} Y{arm_y:.0f} 半径{radius:.0f}mm → '
+                f'届かない (傾けても{MAX_REACH_TILT_DEG}°が上限)',
+                f'NG r{radius:.0f}', (0, 0, 255))
+
+    roll, why = wants_vertical(gap)
+
     where = f'X{arm_x:.0f} Y{arm_y:.0f} 半径{radius:.0f}mm'
     if auto_vertical_grab and gap is not None:
         where += f' 隣{gap:.0f}mm'
-    if r2 is None:
-        return (f'狙い: {where} → 届かない (傾けても{MAX_REACH_TILT_DEG}°が上限)',
-                f'NG r{radius:.0f}', (0, 0, 255))
-    roll, why = wants_vertical(gap)
+
     vg = f' ({why})' if roll else ''
     tag = ' V' if roll else ''
     lean = PICK_PITCH - r2
@@ -1477,7 +1556,7 @@ def open_retry_adjust(dirs):
     (1-5, in cm; 1 = RETRY_STEP, the default), and the corners move X and Y by
     that same amount each. 上 is 奥 and 下 is 手前, seen from the base - `dirs`
     decides that, see retry_step_dirs."""
-    KEY = dict(size=(5, 2), font=('Helvetica', 22, 'bold'))
+    KEY = dict(size=(5, 2), font=(UI_FONT, 22, 'bold'))
     tip = ('ベースから見た向き（上＝奥、下＝手前）に、'
            '右で選んだぶんだけずらして掴み直します')
 
@@ -1494,7 +1573,7 @@ def open_retry_adjust(dirs):
     side = [
         [ sg.Text('補正量') ],
         [ sg.Combo(list(range(1, 6)), default_value=1, key='-amount-', readonly=True,
-                    size=(4, 1), font=('Helvetica', 16)) ],
+                    size=(4, 1), font=(UI_FONT, 16)) ],
         [ sg.Text('cm') ],
     ]
 
@@ -1502,7 +1581,7 @@ def open_retry_adjust(dirs):
         [ sg.Column(pad, element_justification='center'),
           sg.VerticalSeparator(),
           sg.Column(side, element_justification='center', pad=((12, 4), (24, 0))) ],
-        [ sg.HorizontalSeparator() ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
         [ sg.Button('中止', key='-cancel-') ],
     ]
     win = sg.Window('掴み直し', layout, modal=True, finalize=True)
@@ -1703,11 +1782,11 @@ def open_manual_control():
     # element, and drawing one on a Graph would mean hand-rolling the
     # hit-testing math for which wedge was pressed - not worth the risk of
     # quietly getting a direction backwards on a physical arm).
-    DBTN = dict(font=('Helvetica', 18, 'bold'), size=(3, 1))
+    DBTN = dict(font=(UI_FONT, 18, 'bold'), size=(3, 1))
     dpad = [
         [ sg.Text(''), sg.Button('▲', key='-mc-Up-', **DBTN), sg.Text('') ],
         [ sg.Button('◀', key='-mc-Left-', **DBTN),
-          sg.Button('●', key='-mc-center-', font=('Helvetica', 10), size=(3, 1),
+          sg.Button('●', key='-mc-center-', font=(UI_FONT, 10), size=(3, 1),
                      disabled=True, button_color=('gray', sg.theme_background_color())),
           sg.Button('▶', key='-mc-Right-', **DBTN) ],
         [ sg.Text(''), sg.Button('▼', key='-mc-Down-', **DBTN), sg.Text('') ],
@@ -1726,20 +1805,20 @@ def open_manual_control():
           sg.Button('◀', key='-mc-l-', **DBTN), sg.Button('▶', key='-mc-j-', **DBTN) ],
     ]
     hand_pad = [
-        [ sg.Button('開く', key='-mc-hopen-', font=('Helvetica', 14), size=(6, 1)),
-          sg.Button('閉じる', key='-mc-hclose-', font=('Helvetica', 14), size=(6, 1)) ],
+        [ sg.Button('開く', key='-mc-hopen-', font=(UI_FONT, 14), size=(6, 1)),
+          sg.Button('閉じる', key='-mc-hclose-', font=(UI_FONT, 14), size=(6, 1)) ],
     ]
 
     layout = [
-        [ sg.Column([[sg.Text('位置', font=('Helvetica', 11))]] + dpad,
+        [ sg.Column([[sg.Text('位置', font=(UI_FONT, 11))]] + dpad,
                      element_justification='center'),
           sg.Column(zpad, element_justification='center', pad=((20, 20), (26, 0))),
           sg.VerticalSeparator(),
-          sg.Column([[sg.Text('姿勢', font=('Helvetica', 11))]] + orient_pad, pad=((20, 0), (0, 0))) ],
-        [ sg.HorizontalSeparator() ],
-        [ sg.Text('ハンド', font=('Helvetica', 11)) ],
+          sg.Column([[sg.Text('姿勢', font=(UI_FONT, 11))]] + orient_pad, pad=((20, 0), (0, 0))) ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Text('ハンド', font=(UI_FONT, 11)) ],
         [ sg.Column(hand_pad), sg.Text('--', key='-mc-hand-', size=(6, 1)) ],
-        [ sg.HorizontalSeparator() ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
         [ sg.Text('X'), sg.Text('--', key='-mc-x-val-', size=(6, 1)),
           sg.Text('Y'), sg.Text('--', key='-mc-y-val-', size=(6, 1)),
           sg.Text('Z'), sg.Text('--', key='-mc-z-val-', size=(6, 1)) ],
@@ -1747,10 +1826,10 @@ def open_manual_control():
           sg.Text('R2'), sg.Text('--', key='-mc-r2-val-', size=(6, 1)),
           sg.Text('R3'), sg.Text('--', key='-mc-r3-val-', size=(6, 1)) ],
         [ sg.Text('状態: ', size=(4, 1)), sg.Text('', key='-mc-state-', size=(34, 1)) ],
-        [ sg.HorizontalSeparator() ],
-        [ sg.Text('ボタンは押している間だけ動作します。キーボードも同様:', font=('Helvetica', 8)) ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Text('ボタンは押している間だけ動作します。キーボードも同様:', font=(UI_FONT, 8)) ],
         [ sg.Text('↑↓←→:X/Y位置   PgUp/PgDn:Z   z/x:Roll   i/k:Pitch   j/l:Tilt   o/c:ハンド   r:Ready',
-                  font=('Helvetica', 8)) ],
+                  font=(UI_FONT, 8)) ],
         [ sg.Button('Ready', key='-mc-ready-'), sg.Button('閉じる', key='-mc-exit-') ],
     ]
 
@@ -1954,13 +2033,13 @@ def open_autov_settings(params):
         [ sg.Text('自動縦掴み: どれだけ近ければ縦にして掴むか') ],
         [ sg.Text('アイテムの中心どうしの距離です。これ以内に他のアイテムが\n'
                   'あるときだけ、グリッパーを回して掴みに行きます。',
-                  font=('Helvetica', 9)) ],
+                  font=(UI_FONT, 9)) ],
         [ sg.Slider(range=(AUTO_VERTICAL_GAP_MIN, AUTO_VERTICAL_GAP_MAX), resolution=5,
                     orientation='h', default_value=float(auto_vertical_gap),
                     size=(34, 20), enable_events=True, key='-av-gap-'),
           sg.Text('mm') ],
-        [ sg.Text('', key='-av-note-', size=(40, 1), font=('Helvetica', 9)) ],
-        [ sg.HorizontalSeparator() ],
+        [ sg.Text('', key='-av-note-', size=(40, 1), font=(UI_FONT, 9)) ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
         [ sg.Button('保存', key='-av-save-', size=(8, 1)),
           sg.Button('キャンセル', key='-av-cancel-', size=(10, 1)) ],
     ]
@@ -2018,18 +2097,18 @@ def open_grip_settings(params, grip_close):
         [ sg.Text('スライダーを動かすと、その角度までハンドが実際に閉じます。') ],
         [ sg.Text(f'{GRIP_CLOSE_MIN} = 完全に閉じる（最も強い）   '
                   f'{GRIP_CLOSE_MAX} = ゆるい   （全開は {GRIP_OPEN}）',
-                  font=('Helvetica', 9)) ],
+                  font=(UI_FONT, 9)) ],
         [ sg.Text('物をハンドに挟んで、落ちずにつぶれない所に合わせてください。',
-                  font=('Helvetica', 9)) ],
+                  font=(UI_FONT, 9)) ],
     ] + rows + [
-        [ sg.HorizontalSeparator() ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
         [
             sg.Button('開く', key='-gc-open-', size=(8, 1)),
             sg.Text('現在のハンド角度:'),
             sg.Text('--', key='-gc-current-', size=(6, 1)),
             sg.Text('', key='-gc-which-', size=(24, 1)),
         ],
-        [ sg.HorizontalSeparator() ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
         [ sg.Button('保存して閉じる', key='-gc-save-'), sg.Button('キャンセル', key='-gc-cancel-') ],
     ]
 
@@ -2076,6 +2155,8 @@ if __name__ == '__main__':
     sel_color = None
     sel_shape = None
 
+    apply_style()
+
     params = read_params()
 
     marker_ids = params['marker-ids']
@@ -2104,10 +2185,11 @@ if __name__ == '__main__':
 
     marker_table = np.array([[0] * 5] * len(marker_ids), dtype=np.float32)
 
-    COLOR_BTN = {'red': ('white', '#c0392b'), 'green': ('white', '#27ae60'), 'blue': ('white', '#2980b9')}
+    COLOR_BTN = {'red': ('#140b0c', COL_RED), 'green': ('#07130b', COL_GREEN),
+                 'blue': ('#0b1120', COL_BLUE)}
 
     debug_layout = [
-        [ sg.Text('TCP pose', font=('Helvetica', 11)) ],
+        [ sg.Text('TCP pose', font=(UI_FONT, 10, 'bold'), text_color=COL_MUTED) ],
         spin('X', 'X' , 0,    0, 400 ),
         spin('Y', 'Y' , 0, -300, 300 ),
         spin('Z', 'Z' , 0,    0, 150 ),
@@ -2116,34 +2198,39 @@ if __name__ == '__main__':
         spin('R3', 'R3', 0, -90,  90 ),
         spin('hand', 'hand', 0,   0, 100 ),
         [ sg.Table(marker_table.tolist(), headings=['cam x', 'cam y', 'cam z', 'scr x', 'scr y'],
-                   auto_size_columns=False, col_widths=[6] * 5, num_rows=len(marker_ids), key='-marker-table-') ],
+                   auto_size_columns=False, col_widths=[6] * 5, num_rows=len(marker_ids),
+                   font=(MONO_FONT, 9), header_font=(UI_FONT, 9, 'bold'),
+                   header_background_color=COL_BG, header_text_color=COL_MUTED,
+                   background_color=COL_PANEL, text_color=COL_TEXT,
+                   alternating_row_color='#262e3d', border_width=0,
+                   key='-marker-table-') ],
     ]
 
     box_rows = []
     for c in SORT_COLORS:
         box_rows.append([
             sg.Text(COLOR_BTN_TEXT[c], size=(5, 1), text_color=COLOR_BTN[c][1]),
-            sg.Text(box_label(c), key=f'-box-{c}-', size=(24, 1), font=('Consolas', 9)),
+            sg.Text(box_label(c), key=f'-box-{c}-', size=(24, 1), font=(MONO_FONT, 9)),
             sg.Button('ここに登録', key=f'setbox-{c}'),
             sg.Button('移動', key=f'gotobox-{c}'),
         ])
 
     control_col = sg.Column([
-        [ sg.Text('モデル: 未ロード', key='-model-', size=(34, 1)) ],
+        [ sg.Text('モデル: 未ロード', key='-model-', size=(34, 1), text_color=COL_MUTED) ],
         [ sg.Text('対象: 全部 / 全部', key='-target-', size=(34, 1)) ],
-        [ sg.Text('検出: -', key='-detect-', size=(34, 1)) ],
-        [ sg.Text('狙い: -', key='-aim-', size=(34, 2)) ],
-        [ sg.Text('TCP height: -', key='-tcp-height-', size=(34, 1)) ],
-        [ sg.Text('状態: 待機', key='-state-', size=(34, 2)) ],
-        [ sg.HorizontalSeparator() ],
-        [ sg.Text('仕分け対象 - 色') ],
+        [ sg.Text('検出: -', key='-detect-', size=(34, 1), text_color=COL_MUTED) ],
+        [ sg.Text('狙い: -', key='-aim-', size=(34, 2), text_color='#8fd3ff') ],
+        [ sg.Text('TCP height: -', key='-tcp-height-', size=(34, 1), text_color=COL_MUTED) ],
+        [ sg.Text('状態: 待機', key='-state-', size=(34, 2), font=(UI_FONT, 10, 'bold')) ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Text('仕分け対象 - 色', font=(UI_FONT, 9, 'bold'), text_color=COL_MUTED) ],
         [
             sg.Button('赤', key='selc-red', size=(6, 2), button_color=COLOR_BTN['red']),
             sg.Button('青', key='selc-blue', size=(6, 2), button_color=COLOR_BTN['blue']),
             sg.Button('緑', key='selc-green', size=(6, 2), button_color=COLOR_BTN['green']),
             sg.Button('色:全部', key='selc-all', size=(8, 2)),
         ],
-        [ sg.Text('仕分け対象 - 形状') ],
+        [ sg.Text('仕分け対象 - 形状', font=(UI_FONT, 9, 'bold'), text_color=COL_MUTED) ],
         [
             sg.Button('キューブ', key='selsh-cube', size=(9, 2)),
             sg.Button('ラグビー', key='selsh-ragby', size=(9, 2)),
@@ -2151,11 +2238,11 @@ if __name__ == '__main__':
             sg.Button('形:全部', key='selsh-all', size=(8, 2)),
         ],
         [
-            sg.Button('つかんで置く', key='pick', size=(18, 2)),
-            sg.Button('自動仕分け 開始', key='auto', size=(18, 2)),
+            sg.Button('つかんで置く', key='pick', size=(18, 2), button_color=COL_ACCENT),
+            sg.Button('自動仕分け 開始', key='auto', size=(18, 2), button_color=COL_ACCENT),
         ],
         [ sg.Button('掴み直し', key='retry', size=(18, 2)),
-          sg.Button('やり直し', key='reset-all', size=(18, 2),
+          sg.Button('やり直し', key='reset-all', size=(18, 2), button_color=COL_WARN,
                     tooltip='動作を中断してすべての状態をリセットし、Ready に戻る') ],
         [ sg.Button('縦掴み: OFF', key='vgrab', size=(18, 2),
                     tooltip=f'ON の間は、Z を下げる前にグリッパーを'
@@ -2168,33 +2255,39 @@ if __name__ == '__main__':
         [ sg.Button('つかむ強さの設定', key='grip-settings'),
           sg.Button('自動仕分けの設定', key='auto-setup'),
           sg.Button('手動', key='manual-control') ],
-        [ sg.HorizontalSeparator() ],
-        [ sg.Text('つかみ位置の補正(mm)  ズレる方向と逆に、Enterで確定') ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Text('つかみ位置の補正(mm)  ズレる方向と逆に、Enterで確定',
+                  font=(UI_FONT, 9, 'bold'), text_color=COL_MUTED) ],
         [
             *spin('dX', '-poff-x-', int(pick_offset['x']), -50, 50),
             *spin('dY', '-poff-y-', int(pick_offset['y']), -50, 50),
             *spin('dZ', '-poff-z-', int(pick_offset['z']), -50, 50),
         ],
-        [ sg.HorizontalSeparator() ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
         [
-            sg.Text('移動時間'),
+            sg.Text('移動時間', text_color=COL_MUTED),
             sg.Slider(range=(0.5, 4.0), default_value=get_move_time(), resolution=0.1,
                       orientation='h', size=(18, 15), key='-mt-', enable_events=True),
         ],
-        [ sg.HorizontalSeparator() ],
-        [ sg.Text('箱の位置  （矢印キー等で動かして「ここに登録」）') ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Text('箱の位置  （矢印キー等で動かして「ここに登録」）',
+                  font=(UI_FONT, 9, 'bold'), text_color=COL_MUTED) ],
         [ sg.Text('↑↓:X前後   ←→:Y左右   PgUp/PgDn:Z上下   o/c:ハンド   r:Ready',
-                  font=('Helvetica', 8)) ],
+                  font=(UI_FONT, 8), text_color=COL_MUTED) ],
     ] + box_rows + [
-        [ sg.HorizontalSeparator() ],
-        [ sg.Text('キャリブレーション') ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Text('キャリブレーション', font=(UI_FONT, 9, 'bold'), text_color=COL_MUTED) ],
         [
             sg.Button('Reset', tooltip='平面（法線・基準点）を測り直す'),
-            sg.Button('Adjust XY', tooltip='ハンドアイ・キャリブレーション'),
+            # the label is Japanese now; the key keeps the old event name so
+            # everything that refers to "Adjust XY" (handler, logs) still does
+            sg.Button('キャリブレーション', key='Adjust XY',
+                      tooltip='ハンドアイ・キャリブレーション'),
             sg.Button('Test XY', tooltip='画面座標→アーム座標の確認'),
         ],
-        [ sg.HorizontalSeparator() ],
-        [ sg.Button('Ready'), sg.Button('詳細表示', key='toggle-debug'), sg.Button('終了', key='Close') ],
+        [ sg.HorizontalSeparator(color=COL_LINE) ],
+        [ sg.Button('Ready'), sg.Button('詳細表示', key='toggle-debug'),
+          sg.Button('終了', key='Close', button_color=COL_WARN) ],
         [ sg.pin(sg.Column(debug_layout, key='-dbg-', visible=False)) ],
     ], key='-control-col-', vertical_alignment='top', scrollable=True,
        vertical_scroll_only=True, size=(400, CAM_VIEW), expand_x=True, expand_y=True)
@@ -2220,6 +2313,7 @@ if __name__ == '__main__':
     is_moving = False
 
     moving = None
+    calibrating = False      # a calibrate_xy() run is in flight (see 'Adjust XY')
     test_pos = None
     frame = None
     tcp_cam = tcp_scr = None
@@ -2254,6 +2348,9 @@ if __name__ == '__main__':
                 is_moving = False
                 print('========== stop moving ==========')
                 end_phase()
+                if calibrating:
+                    calibrating = False
+                    window['Adjust XY'].update('キャリブレーション', disabled=False)
                 params['prev-servo'] = servo_angles
                 write_params(params)
 
@@ -2278,7 +2375,7 @@ if __name__ == '__main__':
 
         elif event == 'Ready':
             auto_mode = False
-            window['auto'].update('自動仕分け 開始')
+            window['auto'].update('自動仕分け 開始', button_color=COL_ACCENT)
             jog_dir = None
             hand_dir = 0
             moving = move_to_ready()
@@ -2287,7 +2384,19 @@ if __name__ == '__main__':
             moving = test_xy()
 
         elif event == 'Adjust XY':
-            moving = calibrate_xy()
+            # One run at a time. Pressing it again used to throw the running
+            # calibration away and start a fresh one from the top - with the
+            # arm still touring the stations, so it looked like one long run
+            # that kept popping up 完了 boxes (one per run that got far
+            # enough to fit). The button goes dead for the duration, which
+            # also means a click cannot sit in the queue waiting to restart it.
+            if moving is not None:
+                set_state('実行中です。終わるまでお待ちください')
+            else:
+                calibrating = True
+                window['Adjust XY'].update('キャリブレーション中…', disabled=True)
+                set_state('キャリブレーションを開始しました')
+                moving = calibrate_xy()
 
         elif event == 'Reset':
             normal_vector = None
@@ -2349,7 +2458,8 @@ if __name__ == '__main__':
             # Same kind of mode as 'vgrab', but the decision is per item and
             # is made at detection time (see nearest_item_gap/wants_vertical).
             auto_vertical_grab = not auto_vertical_grab
-            window['vgrab-auto'].update('自動縦掴み: ' + ('ON' if auto_vertical_grab else 'OFF'))
+            window['vgrab-auto'].update('自動縦掴み: ' + ('ON' if auto_vertical_grab else 'OFF'),
+                                        button_color=COL_ON if auto_vertical_grab else COL_BTN)
             set_state('自動縦掴み: ' + (f'ON - 他のアイテムが{auto_vertical_gap:.0f}mm 以内のときだけ縦にします'
                                    if auto_vertical_grab else 'OFF'))
 
@@ -2358,7 +2468,8 @@ if __name__ == '__main__':
             # approaches (see grab()), so it is safe to toggle at any time and
             # deliberately survives やり直し - like the target/box settings.
             vertical_grab = not vertical_grab
-            window['vgrab'].update(f'縦掴み: ' + ('ON' if vertical_grab else 'OFF'))
+            window['vgrab'].update(f'縦掴み: ' + ('ON' if vertical_grab else 'OFF'),
+                                   button_color=COL_ON if vertical_grab else COL_BTN)
             set_state(f'縦掴み: ' + (f'ON - グリッパーを{VERTICAL_GRAB_ROLL:.0f}°回して掴みます'
                                    if vertical_grab else 'OFF - 通常の向きで掴みます'))
 
@@ -2374,11 +2485,14 @@ if __name__ == '__main__':
             auto_mode = False
             auto_step_idx = 0
             auto_state = 'idle'
-            window['auto'].update('自動仕分け 開始')
+            window['auto'].update('自動仕分け 開始', button_color=COL_ACCENT)
             jog_dir = None
             jog_pos = None
             hand_dir = 0
             last_grab = None
+            if calibrating:
+                calibrating = False
+                window['Adjust XY'].update('キャリブレーション', disabled=False)
             moving = move_to_ready()
             set_state('やり直し: 状態をリセットして Ready に戻ります')
 
@@ -2387,7 +2501,7 @@ if __name__ == '__main__':
             # and run straight from what was saved there.
             if auto_mode:
                 auto_mode = False
-                window['auto'].update('自動仕分け 開始')
+                window['auto'].update('自動仕分け 開始', button_color=COL_ACCENT)
                 set_state('自動仕分けを停止しました')
             else:
                 seq = [ (c, s) for c, s in params.get('auto-sequence', []) ]
@@ -2399,7 +2513,7 @@ if __name__ == '__main__':
                     auto_step_idx = 0
                     auto_state = 'idle'
                     auto_mode = True
-                    window['auto'].update('自動仕分け 停止')
+                    window['auto'].update('自動仕分け 停止', button_color=COL_WARN)
                     set_state(f'自動仕分けを開始しました（{len(seq)}件）')
 
         elif event == 'auto-setup':
@@ -2518,7 +2632,7 @@ if __name__ == '__main__':
         if auto_mode and moving is None:
             if auto_step_idx >= len(auto_queue):
                 auto_mode = False
-                window['auto'].update('自動仕分け 開始')
+                window['auto'].update('自動仕分け 開始', button_color=COL_ACCENT)
                 set_state('自動仕分け シーケンス完了')
             else:
                 color, shape = auto_queue[auto_step_idx]
