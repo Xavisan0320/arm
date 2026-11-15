@@ -164,7 +164,7 @@ Adjust XY 中に `skipping` と出るのは、その地点でグリッパーの�
 | `angle.py` / `pulse.py` / `yoko.py` | 関節角の較正、パルス確認、キーボード操作 |
 | `board.py` / `print.py` | カメラ較正用ボード・マーカーの生成 |
 | `pico/main.py` | Pico のファームウェア（PCA9685 制御） |
-| `contest.pt` | YOLO モデル |
+| `best.pt` | YOLO モデル（学習結果の best.pt をそのまま置く） |
 | `data/arm.json` | 設定と較正データ（この機体用） |
 | `setup_venv.ps1` / `requirements.txt` | 環境構築（本手順書） |
 | `requirements-lock.txt` | 動作確認済み環境の全パッケージ一覧（参考用） |

@@ -10,7 +10,7 @@ def infer_img(img_que: Queue, result_que: Queue):
 
     print("Loading YOLO model...", flush=True)
 
-    model = YOLO("contest.pt")
+    model = YOLO("best.pt")
 
     print("MODEL:", model.names, flush=True)
     print("YOLO model loaded!", flush=True)
@@ -85,7 +85,7 @@ def infer_img(img_que: Queue, result_que: Queue):
                 )
 
                 # 色・形状が指定されている場合。クラス名は "{色}_{形状}" 形式
-                # ("red_cube", "red_ragby", ...) を前提に、どちらか片方だけの
+                # ("red_cube", "red_rugby", ...) を前提に、どちらか片方だけの
                 # 指定でも絞り込めるようにする。
                 if color is not None or shape is not None:
 
@@ -285,13 +285,15 @@ if __name__ == '__main__':
     inference = Inference()
 
     # --------------------------------
-    # テスト対象
+    # テスト対象（色・形状それぞれ None = 全部）
     #
-    # None       = 全クラス
-    # blue_cube  = 青
-    # green_cube = 緑
-    # red_cube   = 赤キューブ
-    # red_ragby  = 赤ラグビー
+    # target_color : 'red' / 'green' / 'blue'
+    # target_shape : 'cube' / 'rugby' / 'pyramid'
+    #
+    # best.pt のクラスは 色×形状 の 9 種類:
+    #   blue_cube  blue_pyramid  blue_rugby
+    #   green_cube green_pyramid green_rugby
+    #   red_cube   red_pyramid   red_rugby
     # --------------------------------
 
     target_color = None

@@ -137,12 +137,12 @@ Z_SEARCH_FLOOR_TOL = 8.0
 # Sorting colors -> one physical box each. Shapes only filter detection; the
 # box a work is dropped into is always chosen by its color.
 SORT_COLORS = ['red', 'green', 'blue']
-SHAPES = ['cube', 'ragby', 'pyramid']
+SHAPES = ['cube', 'rugby', 'pyramid']
 
 COLOR_BTN_TEXT = {'red': '赤', 'green': '緑', 'blue': '青'}
-SHAPE_BTN_TEXT = {'cube': 'キューブ', 'ragby': 'ラグビー', 'pyramid': 'ピラミッド'}
+SHAPE_BTN_TEXT = {'cube': 'キューブ', 'rugby': 'ラグビー', 'pyramid': 'ピラミッド'}
 COLOR_LABEL = {None: '全部', 'red': '赤', 'green': '緑', 'blue': '青'}
-SHAPE_LABEL = {None: '全部', 'cube': 'キューブ', 'ragby': 'ラグビー', 'pyramid': 'ピラミッド'}
+SHAPE_LABEL = {None: '全部', 'cube': 'キューブ', 'rugby': 'ラグビー', 'pyramid': 'ピラミッド'}
 
 DEFAULT_BOXES = {
     'red':   [150.0, -120.0, float(PLACE_Z)],
@@ -2233,7 +2233,7 @@ if __name__ == '__main__':
         [ sg.Text('仕分け対象 - 形状', font=(UI_FONT, 9, 'bold'), text_color=COL_MUTED) ],
         [
             sg.Button('キューブ', key='selsh-cube', size=(9, 2)),
-            sg.Button('ラグビー', key='selsh-ragby', size=(9, 2)),
+            sg.Button('ラグビー', key='selsh-rugby', size=(9, 2)),
             sg.Button('ピラミッド', key='selsh-pyramid', size=(9, 2)),
             sg.Button('形:全部', key='selsh-all', size=(8, 2)),
         ],
@@ -2422,7 +2422,7 @@ if __name__ == '__main__':
             sel_color = None if c == 'all' else c
             refresh_selection_labels()
 
-        elif event in ('selsh-cube', 'selsh-ragby', 'selsh-pyramid', 'selsh-all'):
+        elif event in ('selsh-cube', 'selsh-rugby', 'selsh-pyramid', 'selsh-all'):
             ensure_inference()
             s = event.split('-')[1]
             sel_shape = None if s == 'all' else s

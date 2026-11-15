@@ -108,7 +108,7 @@ that needs to run "at the same time" as a move should be composed this way rathe
 
 ### Vision pipeline
 
-`infer.py` runs a YOLO model (`contest.pt`) in a separate `multiprocessing.Process`
+`infer.py` runs a YOLO model (`best.pt`) in a separate `multiprocessing.Process`
 (`Inference` class) so detection doesn't stall the GUI loop; frames are pushed in and results pulled
 back non-blockingly (`img_que`/`result_que`). Model classes are named `"{color}_{shape}"`
 (e.g. `red_cube`); `arm.py` matches on either half independently (color-only or shape-only
